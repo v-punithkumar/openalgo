@@ -94,9 +94,11 @@ def validate_order(order_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     if order_data.get('exchange') not in VALID_EXCHANGES:
         return False, f'Invalid exchange. Must be one of: {", ".join(VALID_EXCHANGES)}'
 
-    # Validate action
-    if order_data.get('action') not in VALID_ACTIONS:
-        return False, f'Invalid action. Must be one of: {", ".join(VALID_ACTIONS)}'
+    # Convert action to uppercase and validate
+    if 'action' in order_data:
+        order_data['action'] = order_data['action'].upper()
+        if order_data['action'] not in VALID_ACTIONS:
+            return False, f'Invalid action. Must be one of: {", ".join(VALID_ACTIONS)} (case insensitive)'
 
     # Validate price type
     if 'pricetype' in order_data and order_data['pricetype'] not in VALID_PRICE_TYPES:
@@ -200,12 +202,13 @@ def process_basket_order_with_auth(
         total_orders = len(basket_data['orders'])
         
         for i, order in enumerate(basket_data['orders']):
-            # Add common fields from basket order
-            order['apikey'] = api_key
-            order['strategy'] = basket_data['strategy']
+            # Create order data with common fields from basket order
+            order_with_auth = order.copy()
+            order_with_auth['apikey'] = api_key
+            order_with_auth['strategy'] = basket_data['strategy']
             
             # Validate order
-            is_valid, error_message = validate_order(order)
+            is_valid, error_message = validate_order(order_with_auth)
             if not is_valid:
                 analyze_results.append({
                     'symbol': order.get('symbol', 'Unknown'),
@@ -215,7 +218,7 @@ def process_basket_order_with_auth(
                 continue
 
             # Analyze the order
-            _, analysis = analyze_request(order, 'basketorder', True)
+            _, analysis = analyze_request(order_with_auth, 'basketorder', True)
             
             if analysis.get('status') == 'success':
                 analyze_results.append({
@@ -276,11 +279,12 @@ def process_basket_order_with_auth(
         # Process all BUY orders first
         buy_futures = []
         for i, order in enumerate(buy_orders):
-            order['strategy'] = basket_data['strategy']
+            # Create order with authentication fields without modifying original
+            order_with_auth = {**order, 'apikey': api_key, 'strategy': basket_data['strategy']}
             buy_futures.append(
                 executor.submit(
                     place_single_order,
-                    {**order, 'apikey': api_key},
+                    order_with_auth,
                     broker_module,
                     auth_token,
                     total_orders,
@@ -297,11 +301,12 @@ def process_basket_order_with_auth(
         # Then process SELL orders
         sell_futures = []
         for i, order in enumerate(sell_orders, start=len(buy_orders)):
-            order['strategy'] = basket_data['strategy']
+            # Create order with authentication fields without modifying original
+            order_with_auth = {**order, 'apikey': api_key, 'strategy': basket_data['strategy']}
             sell_futures.append(
                 executor.submit(
                     place_single_order,
-                    {**order, 'apikey': api_key},
+                    order_with_auth,
                     broker_module,
                     auth_token,
                     total_orders,
@@ -362,8 +367,7 @@ def place_basket_order(
                 'status': 'error',
                 'message': 'Invalid openalgo apikey'
             }
-            if not get_analyze_mode():
-                log_executor.submit(async_log_order, 'basketorder', original_data, error_response)
+            # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
         
         return process_basket_order_with_auth(basket_data, AUTH_TOKEN, broker_name, original_data)

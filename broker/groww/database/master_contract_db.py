@@ -409,8 +409,8 @@ def download_groww_instrument_data(output_path):
     file_path = os.path.join(output_path, "master.csv")
     csv_url = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
-    # Expected headers
-    headers_csv = "exchange,exchange_token,trading_symbol,groww_symbol,name,instrument_type,segment,series,isin,underlying_symbol,underlying_exchange_token,expiry_date,lot_size,strike_price,tick_size,freeze_quantity,is_reserved,buy_allowed,sell_allowed,feed_key"
+    # Expected headers - Updated to match actual CSV structure
+    headers_csv = "exchange,exchange_token,trading_symbol,groww_symbol,name,instrument_type,segment,series,isin,underlying_symbol,underlying_exchange_token,expiry_date,strike_price,lot_size,tick_size,freeze_quantity,is_reserved,buy_allowed,sell_allowed,internal_trading_symbol,is_intraday"
     expected_headers = headers_csv.split(",")
 
     try:
@@ -582,8 +582,8 @@ def process_groww_data(path):
         
         # Swap lot_size and strike as they're reversed in the input data
         # Store the correctly mapped values using a temporary column
-        df_mapped['temp_strike'] = pd.to_numeric(df_mapped['lotsize'], errors='coerce').fillna(0)
-        df_mapped['lotsize'] = pd.to_numeric(df_mapped['strike'], errors='coerce').fillna(1).astype(int)
+        df_mapped['temp_strike'] = pd.to_numeric(df_mapped['strike'], errors='coerce').fillna(0)
+        df_mapped['lotsize'] = pd.to_numeric(df_mapped['lotsize'], errors='coerce').fillna(1).astype(int)
         df_mapped['strike'] = df_mapped['temp_strike']
         df_mapped.drop('temp_strike', axis=1, inplace=True)
         df_mapped['tick_size'] = pd.to_numeric(df_mapped['tick_size'], errors='coerce').fillna(0.05)
@@ -796,16 +796,18 @@ def process_groww_data(path):
     return token_df
 
 def delete_groww_temp_data(output_path):
-    """Delete temporary files created during instrument data download"""
+    """Delete only Groww-specific temporary files created during instrument data download"""
     try:
-        # Check each file in the directory
-        for filename in os.listdir(output_path):
-            # Construct the full file path
+        # List of Groww-specific files to delete
+        groww_files = ['master.csv', 'groww_instruments.csv', 'groww_master.csv']
+        
+        # Check each Groww-specific file
+        for filename in groww_files:
             file_path = os.path.join(output_path, filename)
-            # Check if it is a file (not a directory)
+            # Check if the file exists and delete it
             if os.path.isfile(file_path):
                 os.remove(file_path)
-                logger.info(f"Deleted temporary file: {file_path}")
+                logger.info(f"Deleted Groww temporary file: {file_path}")
         
         # Check if the directory is now empty
         if not os.listdir(output_path):
