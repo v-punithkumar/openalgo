@@ -143,6 +143,9 @@ class BrokerData:
             '15m': '15minute',
             '30m': '30minute',
             '60m': '60minute',
+            # For flux scan to work for 1h interval
+            '1h': '60minute',
+            
             # Daily
             'D': 'day'
         }
@@ -241,7 +244,8 @@ class BrokerData:
             }
             
         except ZerodhaPermissionError as e:
-            logger.exception(f"Permission error fetching quotes: {e}")
+            # Log at debug level to avoid spam for personal API without data feed
+            logger.debug(f"Permission error fetching quotes: {e}")
             raise
         except (ZerodhaAPIError, Exception) as e:
             logger.exception(f"Error fetching quotes: {e}")

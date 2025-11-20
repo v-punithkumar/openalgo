@@ -16,26 +16,38 @@ logger = get_logger(__name__)
 
 def get_api_response(endpoint, auth, method="POST", payload=''):
     AUTH_TOKEN = auth
-    client_id = os.getenv('BROKER_API_KEY')
-    
+
+    # Get client_id from BROKER_API_KEY environment variable
+    # Format: client_id:::api_key
+    broker_api_key = os.getenv('BROKER_API_KEY')
+    if not broker_api_key:
+        raise Exception("BROKER_API_KEY not found in environment variables")
+
+    if ':::' in broker_api_key:
+        client_id = broker_api_key.split(':::')[0]
+    else:
+        client_id = broker_api_key
+
     if not client_id:
-        raise Exception("Could not extract client ID from auth token")
-    
+        raise Exception("Could not extract client ID from BROKER_API_KEY")
+
+    logger.debug(f"Using client_id: {client_id} for Dhan API request")
+
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
-    
+
     headers = {
         'access-token': AUTH_TOKEN,
         'client-id': client_id,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
     }
-    
+
     url = get_url(endpoint)
-    
-    #logger.info(f"Making request to {url}")
-    #logger.info(f"Headers: {headers}")
-    #logger.info(f"Payload: {payload}")
+
+    logger.debug(f"Making request to {url}")
+    #logger.debug(f"Headers: {headers}")
+    #logger.debug(f"Payload: {payload}")
     
     if method == "GET":
         res = client.get(url, headers=headers)
@@ -134,7 +146,7 @@ class BrokerData:
             return int(ist_dt.timestamp())
 
     def _get_intraday_chunks(self, start_date, end_date) -> list:
-        """Split date range into 5-day chunks for intraday data"""
+        """Split date range into 90-day chunks for intraday data (Dhan API limit)"""
         # Handle both string and datetime.date objects
         if isinstance(start_date, str):
             start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -148,7 +160,7 @@ class BrokerData:
         chunks = []
         
         while start < end:
-            chunk_end = min(start + timedelta(days=5), end)
+            chunk_end = min(start + timedelta(days=90), end)
             chunks.append((
                 start.strftime("%Y-%m-%d"),
                 chunk_end.strftime("%Y-%m-%d")

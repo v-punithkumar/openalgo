@@ -3,6 +3,7 @@
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, MetaData, Text
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.pool import NullPool
 import os
 from utils.logging import get_logger
 from cryptography.fernet import Fernet
@@ -12,12 +13,22 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=50,
-    max_overflow=100,
-    pool_timeout=10
-)
+# Conditionally create engine based on DB type
+if DATABASE_URL and 'sqlite' in DATABASE_URL:
+    # SQLite: Use NullPool to prevent connection pool exhaustion
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={'check_same_thread': False}
+    )
+else:
+    # For other databases like PostgreSQL, use connection pooling
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=50,
+        max_overflow=100,
+        pool_timeout=10
+    )
 
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
@@ -46,17 +57,19 @@ class Settings(Base):
 
 def init_db():
     """Initialize the settings database"""
-    logger.info("Initializing Settings DB")
-    
-    # Create tables if they don't exist
-    Base.metadata.create_all(bind=engine)
-    
-    # Create default settings only if no settings exist
-    if not Settings.query.first():
-        logger.info("Creating default settings (Live Mode)")
-        default_settings = Settings(analyze_mode=False)
-        db_session.add(default_settings)
-        db_session.commit()
+    from database.db_init_helper import init_db_with_logging
+    init_db_with_logging(Base, engine, "Settings DB", logger)
+
+    # Create default settings only if no settings exist (with race condition protection)
+    try:
+        if not Settings.query.first():
+            logger.info("Settings DB: Creating default configuration (Live Mode)")
+            default_settings = Settings(analyze_mode=False)
+            db_session.add(default_settings)
+            db_session.commit()
+    except Exception as e:
+        db_session.rollback()
+        logger.debug(f"Settings DB: Default config may already exist (race condition): {e}")
 
 def get_analyze_mode():
     """Get current analyze mode setting"""

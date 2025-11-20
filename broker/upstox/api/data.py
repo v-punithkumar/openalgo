@@ -71,16 +71,35 @@ class BrokerData:
         }
 
     def _get_instrument_key(self, symbol: str, exchange: str) -> str:
-        """Get the correct instrument key for a symbol"""
+        """Get the correct instrument key for a symbol with smart fallback for indices"""
         try:
             # Get token from database - this already includes the exchange prefix
             token = get_token(symbol, exchange)
+
+            # If token not found and exchange looks like it might be an index exchange
+            # Try the _INDEX variant (e.g., NSE -> NSE_INDEX)
+            if not token and exchange in ['NSE', 'BSE', 'MCX']:
+                index_exchange = f"{exchange}_INDEX"
+                logger.debug(f"Token not found for {symbol} on {exchange}, trying {index_exchange}")
+                token = get_token(symbol, index_exchange)
+                if token:
+                    logger.info(f"Found token using index exchange: {index_exchange}")
+
+            # If still not found and exchange is an index exchange, try without _INDEX
+            # (e.g., NSE_INDEX -> NSE)
+            if not token and exchange.endswith('_INDEX'):
+                base_exchange = exchange.replace('_INDEX', '')
+                logger.debug(f"Token not found for {symbol} on {exchange}, trying {base_exchange}")
+                token = get_token(symbol, base_exchange)
+                if token:
+                    logger.info(f"Found token using base exchange: {base_exchange}")
+
             if not token:
                 raise ValueError(f"No token found for {symbol} on {exchange}")
-            
+
             logger.debug(f"Using instrument key: {token}")
             return token
-            
+
         except Exception as e:
             logger.exception(f"Error getting instrument key for {symbol} on {exchange}")
             raise
@@ -97,12 +116,26 @@ class BrokerData:
         Get real-time quotes for given symbol
         Args:
             symbol: Trading symbol
-            exchange: Exchange (e.g., NSE, BSE)
+            exchange: Exchange (e.g., NSE, BSE, NSE_INDEX)
         Returns:
             dict: Quote data with standard fields
         """
         try:
-            # Get the correct instrument key
+            logger.debug(f"get_quotes called with symbol='{symbol}', exchange='{exchange}'")
+
+            # Auto-detect and fix reversed parameters (defensive programming)
+            # Exchange names are typically short codes like NSE, BSE, NFO, etc.
+            # Symbols are typically longer or alphanumeric
+            known_exchanges = ['NSE', 'BSE', 'NFO', 'BFO', 'CDS', 'MCX', 'NSE_INDEX', 'BSE_INDEX', 'MCX_INDEX',
+                             'NSE_EQ', 'NSE_FO', 'BSE_EQ', 'BSE_FO', 'MCX_FO', 'NSE_CD']
+            if symbol in known_exchanges and exchange not in known_exchanges:
+                # Parameters are likely reversed
+                logger.warning(f"Detected reversed parameters: symbol='{symbol}', exchange='{exchange}'. Auto-correcting...")
+                symbol, exchange = exchange, symbol
+                logger.info(f"Corrected to: symbol='{symbol}', exchange='{exchange}'")
+
+            # Get the correct instrument key using the original exchange (important for indices)
+            # This must happen BEFORE exchange normalization (like Angel does)
             instrument_key = self._get_instrument_key(symbol, exchange)
             
             # URL encode the instrument key
@@ -425,24 +458,55 @@ class BrokerData:
                         try:
                             quotes = self.get_quotes(symbol, exchange)
                             logger.info(f"Quotes API response: {quotes}")
-                            
+
                             if quotes and quotes.get('ltp', 0) > 0:
-                                # Create today's daily candle with midnight timestamp
-                                today_ts = int((datetime.combine(today, datetime.min.time()) + timedelta(hours=5, minutes=30)).timestamp())
-                                today_candle = [
-                                    today_ts * 1000,  # Upstox uses milliseconds
-                                    quotes.get('open', quotes.get('ltp', 0)),
-                                    quotes.get('high', quotes.get('ltp', 0)),
-                                    quotes.get('low', quotes.get('ltp', 0)),
-                                    quotes.get('ltp', 0),
-                                    quotes.get('volume', 0),
-                                    quotes.get('oi', 0)
-                                ]
-                                all_candles.append(today_candle)
-                                logger.info("Added today's daily candle from quotes API")
+                                # Check if quotes data is stale by comparing with most recent historical candle
+                                is_stale = False
+                                if all_candles:
+                                    # Find the most recent candle by timestamp (candles may not be sorted yet)
+                                    last_candle = max(all_candles, key=lambda x: x[0])
+                                    # Compare OHLCV with last candle to detect stale quotes
+                                    # If quotes match the last candle exactly, it's likely stale data
+                                    last_open = last_candle[1]
+                                    last_high = last_candle[2]
+                                    last_low = last_candle[3]
+                                    last_close = last_candle[4]
+                                    last_volume = last_candle[5]
+
+                                    quotes_open = quotes.get('open', quotes.get('ltp', 0))
+                                    quotes_high = quotes.get('high', quotes.get('ltp', 0))
+                                    quotes_low = quotes.get('low', quotes.get('ltp', 0))
+                                    quotes_close = quotes.get('ltp', 0)
+                                    quotes_volume = quotes.get('volume', 0)
+
+                                    # Check if all OHLCV values match (indicating stale data)
+                                    if (last_open == quotes_open and
+                                        last_high == quotes_high and
+                                        last_low == quotes_low and
+                                        last_close == quotes_close and
+                                        last_volume == quotes_volume):
+                                        is_stale = True
+                                        logger.warning(f"Quotes data appears stale (identical to last candle). Skipping today's candle to avoid duplicates.")
+                                        logger.warning(f"Last candle: O={last_open}, H={last_high}, L={last_low}, C={last_close}, V={last_volume}")
+                                        logger.warning(f"Quotes data: O={quotes_open}, H={quotes_high}, L={quotes_low}, C={quotes_close}, V={quotes_volume}")
+
+                                if not is_stale:
+                                    # Create today's daily candle with midnight timestamp
+                                    today_ts = int((datetime.combine(today, datetime.min.time()) + timedelta(hours=5, minutes=30)).timestamp())
+                                    today_candle = [
+                                        today_ts * 1000,  # Upstox uses milliseconds
+                                        quotes.get('open', quotes.get('ltp', 0)),
+                                        quotes.get('high', quotes.get('ltp', 0)),
+                                        quotes.get('low', quotes.get('ltp', 0)),
+                                        quotes.get('ltp', 0),
+                                        quotes.get('volume', 0),
+                                        quotes.get('oi', 0)
+                                    ]
+                                    all_candles.append(today_candle)
+                                    logger.info("Added today's daily candle from quotes API")
                             else:
                                 logger.info("No valid quotes data available for today")
-                                
+
                         except Exception as e:
                             logger.info(f"Could not get today's data from quotes API: {e}")
                             logger.exception("Quotes API exception details:")

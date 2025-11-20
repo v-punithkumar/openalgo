@@ -5,8 +5,9 @@ import base64
 from sqlalchemy import create_engine, UniqueConstraint
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean  
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from sqlalchemy.sql import func
+from sqlalchemy.pool import NullPool
 from cachetools import TTLCache
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -82,13 +83,30 @@ auth_cache = TTLCache(maxsize=1024, ttl=get_session_based_cache_ttl())
 feed_token_cache = TTLCache(maxsize=1024, ttl=get_session_based_cache_ttl())
 # Define a cache for broker names with a 5-minute TTL (longer since broker rarely changes)
 broker_cache = TTLCache(maxsize=1024, ttl=3000)
+# Define a cache for verified API keys with 24-hour TTL
+# Security: Only caches user_id (not sensitive), invalidated on key regeneration
+# Long TTL is safe because cache is invalidated when keys are regenerated
+verified_api_key_cache = TTLCache(maxsize=1024, ttl=36000)  # 10 hours
+# Define a cache for invalid API keys with shorter 5-minute TTL (prevent cache poisoning)
+invalid_api_key_cache = TTLCache(maxsize=512, ttl=300)  # 5 minutes
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=50,
-    max_overflow=100,
-    pool_timeout=10
-)
+# Conditionally create engine based on DB type
+if DATABASE_URL and 'sqlite' in DATABASE_URL:
+    # SQLite: Use NullPool to prevent connection pool exhaustion
+    # NullPool creates a new connection for each request and closes it when done
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={'check_same_thread': False}
+    )
+else:
+    # For other databases like PostgreSQL, use connection pooling
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=50,
+        max_overflow=100,
+        pool_timeout=10
+    )
 
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
@@ -111,10 +129,11 @@ class ApiKeys(Base):
     api_key_hash = Column(Text, nullable=False)  # For verification
     api_key_encrypted = Column(Text, nullable=False)  # For retrieval
     created_at = Column(DateTime(timezone=True), default=func.now())
+    order_mode = Column(String(20), default='auto')  # 'auto' or 'semi_auto'
 
 def init_db():
-    logger.info("Initializing Auth DB")
-    Base.metadata.create_all(bind=engine)
+    from database.db_init_helper import init_db_with_logging
+    init_db_with_logging(Base, engine, "Auth DB", logger)
 
 def encrypt_token(token):
     """Encrypt auth token"""
@@ -260,15 +279,28 @@ def get_user_id(name):
         logger.error(f"Error while querying the database for user_id: {e}")
         return None
 
+def invalidate_user_cache(user_id):
+    """
+    Invalidate all cached data for a user when their credentials change.
+    Security: Ensures old API keys/tokens are not usable after regeneration.
+    """
+    # Clear all caches that might contain this user's data
+    auth_cache.clear()
+    broker_cache.clear()
+    feed_token_cache.clear()
+    verified_api_key_cache.clear()
+    invalid_api_key_cache.clear()
+    logger.info(f"Cleared all caches for user_id: {user_id}")
+
 def upsert_api_key(user_id, api_key):
     """Store both hashed and encrypted API key"""
     # Hash with Argon2 for verification
     peppered_key = api_key + PEPPER
     hashed_key = ph.hash(peppered_key)
-    
+
     # Encrypt for retrieval
     encrypted_key = encrypt_token(api_key)
-    
+
     api_key_obj = ApiKeys.query.filter_by(user_id=user_id).first()
     if api_key_obj:
         api_key_obj.api_key_hash = hashed_key
@@ -281,6 +313,10 @@ def upsert_api_key(user_id, api_key):
         )
         db_session.add(api_key_obj)
     db_session.commit()
+
+    # Security: Invalidate all caches when API key changes
+    invalidate_user_cache(user_id)
+
     return api_key_obj.id
 
 def get_api_key(user_id):
@@ -304,12 +340,37 @@ def get_api_key_for_tradingview(user_id):
         return None
 
 def verify_api_key(provided_api_key):
-    """Verify an API key using Argon2"""
+    """
+    Verify an API key using Argon2 with intelligent caching.
+
+    Security measures:
+    - Only caches user_id (not sensitive data)
+    - Uses SHA256 hash as cache key (never stores plaintext)
+    - Invalid keys cached for 5min (prevents brute force)
+    - Valid keys cached for 1hr (balances security vs performance)
+    - Cache invalidated on key regeneration
+    """
     from flask import request, has_request_context
     from utils.ip_helper import get_real_ip
     from database.traffic_db import InvalidAPIKeyTracker
     import hashlib
 
+    # Generate secure cache key (SHA256 hash of API key)
+    # Security: Never store plaintext API key in cache
+    cache_key = hashlib.sha256(provided_api_key.encode()).hexdigest()
+
+    # Step 1: Check invalid cache first (fast rejection of known bad keys)
+    if cache_key in invalid_api_key_cache:
+        logger.debug(f"API key rejected from invalid cache")
+        return None
+
+    # Step 2: Check valid cache (fast path for legitimate requests)
+    if cache_key in verified_api_key_cache:
+        user_id = verified_api_key_cache[cache_key]
+        logger.debug(f"API key verified from cache for user_id: {user_id}")
+        return user_id
+
+    # Step 3: Cache miss - perform expensive Argon2 verification
     peppered_key = provided_api_key + PEPPER
     try:
         # Query all API keys
@@ -319,11 +380,18 @@ def verify_api_key(provided_api_key):
         for api_key_obj in api_keys:
             try:
                 ph.verify(api_key_obj.api_key_hash, peppered_key)
+                # Valid key found - cache it
+                verified_api_key_cache[cache_key] = api_key_obj.user_id
+                logger.debug(f"API key verified and cached for user_id: {api_key_obj.user_id}")
                 return api_key_obj.user_id
             except VerifyMismatchError:
                 continue
 
         # If we reach here, the API key is invalid
+        # Cache the invalid result to prevent repeated expensive verifications
+        invalid_api_key_cache[cache_key] = True
+        logger.debug(f"Invalid API key cached")
+
         # Track the invalid attempt
         try:
             # Check if we're in a request context
@@ -375,9 +443,43 @@ def get_broker_name(provided_api_key):
     return None
 
 def get_auth_token_broker(provided_api_key, include_feed_token=False):
-    """Get auth token, feed token (optional) and broker for a valid API key"""
+    """
+    Get auth token, feed token (optional) and broker for a valid API key with caching.
+
+    Security measures:
+    - Always checks is_revoked status (even for cached data)
+    - Cache cleared on credential changes
+    - TTL based on session expiry time
+    """
+    import hashlib
+
+    # Generate cache key
+    cache_key = f"{hashlib.sha256(provided_api_key.encode()).hexdigest()}_{include_feed_token}"
+
+    # Check cache first (but still verify revocation status)
+    if cache_key in auth_cache:
+        cached_result = auth_cache[cache_key]
+        # Security: Still check if auth is revoked even with cached data
+        user_id = verify_api_key(provided_api_key)
+        if user_id:
+            try:
+                auth_obj = Auth.query.filter_by(name=user_id).first()
+                if auth_obj and auth_obj.is_revoked:
+                    # Token was revoked, remove from cache
+                    del auth_cache[cache_key]
+                    logger.warning(f"Cached auth token was revoked for user_id '{user_id}'.")
+                    return (None, None, None) if include_feed_token else (None, None)
+                # Not revoked, return cached result
+                logger.debug(f"Auth token retrieved from cache for user_id: {user_id}")
+                return cached_result
+            except Exception as e:
+                logger.error(f"Error checking revocation status: {e}")
+                # On error, don't use cache
+                del auth_cache[cache_key]
+
+    # Cache miss or revocation check failed - fetch from database
     user_id = verify_api_key(provided_api_key)
-    
+
     if user_id:
         try:
             auth_obj = Auth.query.filter_by(name=user_id).first()
@@ -385,8 +487,14 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
                 decrypted_token = decrypt_token(auth_obj.auth)
                 if include_feed_token:
                     decrypted_feed_token = decrypt_token(auth_obj.feed_token) if auth_obj.feed_token else None
-                    return decrypted_token, decrypted_feed_token, auth_obj.broker
-                return decrypted_token, auth_obj.broker
+                    result = (decrypted_token, decrypted_feed_token, auth_obj.broker)
+                else:
+                    result = (decrypted_token, auth_obj.broker)
+
+                # Cache the result
+                auth_cache[cache_key] = result
+                logger.debug(f"Auth token cached for user_id: {user_id}")
+                return result
             else:
                 logger.warning(f"No valid auth token or broker found for user_id '{user_id}'.")
                 return (None, None, None) if include_feed_token else (None, None)
@@ -395,3 +503,56 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
             return (None, None, None) if include_feed_token else (None, None)
     else:
         return (None, None, None) if include_feed_token else (None, None)
+
+def get_order_mode(user_id):
+    """
+    Get the order mode for a user (auto or semi_auto)
+
+    Args:
+        user_id: User identifier
+
+    Returns:
+        str: 'auto' or 'semi_auto', defaults to 'auto' if not set
+    """
+    try:
+        api_key_obj = ApiKeys.query.filter_by(user_id=user_id).first()
+        if api_key_obj and api_key_obj.order_mode:
+            return api_key_obj.order_mode
+        return 'auto'  # Default to auto mode
+    except Exception as e:
+        logger.error(f"Error getting order mode for user {user_id}: {e}")
+        return 'auto'  # Default to auto on error
+
+def update_order_mode(user_id, mode):
+    """
+    Update the order mode for a user
+
+    Args:
+        user_id: User identifier
+        mode: 'auto' or 'semi_auto'
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        if mode not in ['auto', 'semi_auto']:
+            logger.error(f"Invalid order mode: {mode}")
+            return False
+
+        api_key_obj = ApiKeys.query.filter_by(user_id=user_id).first()
+        if api_key_obj:
+            api_key_obj.order_mode = mode
+            db_session.commit()
+
+            # Clear caches when mode changes
+            invalidate_user_cache(user_id)
+
+            logger.info(f"Order mode updated to '{mode}' for user: {user_id}")
+            return True
+        else:
+            logger.error(f"No API key found for user: {user_id}")
+            return False
+    except Exception as e:
+        logger.error(f"Error updating order mode: {e}")
+        db_session.rollback()
+        return False

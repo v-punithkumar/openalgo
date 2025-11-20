@@ -24,6 +24,8 @@ from blueprints.search import search_bp
 from blueprints.apikey import api_key_bp
 from blueprints.log import log_bp
 from blueprints.tv_json import tv_json_bp
+from blueprints.gc_json import gc_json_bp
+from blueprints.platforms import platforms_bp
 from blueprints.brlogin import brlogin_bp
 from blueprints.core import core_bp
 from blueprints.analyzer import analyzer_bp  # Import the analyzer blueprint
@@ -38,6 +40,8 @@ from blueprints.pnltracker import pnltracker_bp  # Import the pnl tracker bluepr
 from blueprints.python_strategy import python_strategy_bp  # Import the python strategy blueprint
 from blueprints.telegram import telegram_bp  # Import the telegram blueprint
 from blueprints.security import security_bp  # Import the security blueprint
+from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
+from blueprints.playground import playground_bp  # Import the API playground blueprint
 from services.telegram_bot_service import telegram_bot_service
 from database.telegram_db import get_bot_config
 
@@ -53,6 +57,8 @@ from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
+from database.sandbox_db import init_db as ensure_sandbox_tables_exists
+from database.action_center_db import init_db as ensure_action_center_tables_exists
 
 from utils.plugin_loader import load_broker_auth_functions
 
@@ -86,6 +92,10 @@ def create_app():
     
     # Initialize Socket.IO error handling
     init_socketio_error_handling(socketio)
+
+    # Register custom Jinja2 filters
+    from utils.number_formatter import format_indian_number
+    app.jinja_env.filters['indian_number'] = format_indian_number
 
     # Environment variables
     app.secret_key = os.getenv('APP_KEY')
@@ -156,6 +166,8 @@ def create_app():
     app.register_blueprint(api_key_bp)
     app.register_blueprint(log_bp)
     app.register_blueprint(tv_json_bp)
+    app.register_blueprint(gc_json_bp)
+    app.register_blueprint(platforms_bp)
     app.register_blueprint(brlogin_bp)
     app.register_blueprint(core_bp)
     app.register_blueprint(analyzer_bp)
@@ -170,6 +182,8 @@ def create_app():
     app.register_blueprint(python_strategy_bp)  # Register Python strategy blueprint
     app.register_blueprint(telegram_bp)  # Register Telegram blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
+    app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
+    app.register_blueprint(playground_bp)  # Register API playground blueprint
 
 
     # Exempt webhook endpoints from CSRF protection after app initialization
@@ -257,6 +271,28 @@ def create_app():
             session.clear()
             # Don't redirect here, let individual routes handle it
     
+    @app.errorhandler(400)
+    def csrf_error(error):
+        """Custom handler for CSRF errors (400 Bad Request)"""
+        from flask import request, jsonify, flash, redirect, url_for
+        error_description = str(error)
+
+        logger.warning(f"CSRF Error on {request.path}: {error_description}")
+
+        # Check if it's a CSRF error
+        if 'CSRF' in error_description or 'csrf' in error_description.lower():
+            if request.is_json or request.path.startswith('/api'):
+                return jsonify({
+                    'error': 'CSRF validation failed',
+                    'message': 'Security token expired or invalid. Please refresh the page and try again.'
+                }), 400
+            else:
+                flash('Security token expired. Please try again.', 'error')
+                return redirect(request.referrer or url_for('auth.login'))
+
+        # For other 400 errors
+        return str(error), 400
+
     @app.errorhandler(404)
     def not_found_error(error):
         from flask import request
@@ -291,21 +327,49 @@ def setup_environment(app):
     with app.app_context():
         #load broker plugins
         app.broker_auth_functions = load_broker_auth_functions()
-        # Ensure all the tables exist
-        ensure_auth_tables_exists()
-        ensure_user_tables_exists()
-        ensure_master_contract_tables_exists()
-        ensure_api_log_tables_exists()
-        ensure_analyzer_tables_exists()
-        ensure_settings_tables_exists()
-        ensure_chartink_tables_exists()
-        ensure_traffic_logs_exists()
-        ensure_latency_tables_exists()
-        ensure_strategy_tables_exists()
+
+        # Initialize all databases in parallel for faster startup
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        db_init_functions = [
+            ('Auth DB', ensure_auth_tables_exists),
+            ('User DB', ensure_user_tables_exists),
+            ('Master Contract DB', ensure_master_contract_tables_exists),
+            ('API Log DB', ensure_api_log_tables_exists),
+            ('Analyzer DB', ensure_analyzer_tables_exists),
+            ('Settings DB', ensure_settings_tables_exists),
+            ('Chartink DB', ensure_chartink_tables_exists),
+            ('Traffic Logs DB', ensure_traffic_logs_exists),
+            ('Latency DB', ensure_latency_tables_exists),
+            ('Strategy DB', ensure_strategy_tables_exists),
+            ('Sandbox DB', ensure_sandbox_tables_exists),
+            ('Action Center DB', ensure_action_center_tables_exists),
+        ]
+
+        db_init_start = time.time()
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            # Submit all database initialization tasks
+            futures = {executor.submit(func): name for name, func in db_init_functions}
+
+            # Wait for all to complete
+            for future in as_completed(futures):
+                db_name = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Failed to initialize {db_name}: {e}")
+
+        db_init_time = (time.time() - db_init_start) * 1000
+        logger.info(f"All databases initialized in parallel ({db_init_time:.0f}ms)")
 
     # Conditionally setup ngrok in development environment
     if os.getenv('NGROK_ALLOW') == 'TRUE':
         from pyngrok import ngrok
+        # Disconnect only the 'flask' tunnel if it exists (to avoid "tunnel already exists" error)
+        for tunnel in ngrok.get_tunnels():
+            if tunnel.name == 'flask':
+                ngrok.disconnect(tunnel.public_url)
         public_url = ngrok.connect(name='flask').public_url  # Assuming Flask runs on the default port 5000
         logger.info(f"ngrok URL: {public_url}")
 
@@ -313,6 +377,64 @@ app = create_app()
 
 # Explicitly call the setup environment function
 setup_environment(app)
+
+# Auto-start execution engine and squareoff scheduler if in analyzer mode (parallel startup)
+with app.app_context():
+    try:
+        from database.settings_db import get_analyze_mode
+        from sandbox.execution_thread import start_execution_engine
+        from sandbox.squareoff_thread import start_squareoff_scheduler
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        if get_analyze_mode():
+            # Define service startup functions for parallel execution
+            def start_engine():
+                success, message = start_execution_engine()
+                return ('execution_engine', success, message)
+
+            def start_scheduler():
+                success, message = start_squareoff_scheduler()
+                return ('squareoff_scheduler', success, message)
+
+            def run_catchup():
+                from sandbox.position_manager import catchup_missed_settlements
+                catchup_missed_settlements()
+                return ('catchup_settlement', True, 'Completed')
+
+            # Start all services in parallel
+            startup_start = time.time()
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                # Submit all tasks
+                futures = [
+                    executor.submit(start_engine),
+                    executor.submit(start_scheduler),
+                    executor.submit(run_catchup)
+                ]
+
+                # Collect results as they complete
+                for future in as_completed(futures):
+                    try:
+                        service_name, success, message = future.result()
+                        if service_name == 'execution_engine':
+                            if success:
+                                logger.info("Execution engine auto-started (Analyzer mode is ON)")
+                            else:
+                                logger.warning(f"Failed to auto-start execution engine: {message}")
+                        elif service_name == 'squareoff_scheduler':
+                            if success:
+                                logger.info("Square-off scheduler auto-started (Analyzer mode is ON)")
+                            else:
+                                logger.warning(f"Failed to auto-start square-off scheduler: {message}")
+                        elif service_name == 'catchup_settlement':
+                            logger.info("Catch-up settlement check completed on startup")
+                    except Exception as e:
+                        logger.error(f"Error starting service: {e}")
+
+            startup_time = (time.time() - startup_start) * 1000
+            logger.info(f"Services started in parallel ({startup_time:.0f}ms)")
+    except Exception as e:
+        logger.error(f"Error checking analyzer mode on startup: {e}")
 
 # Integrate the WebSocket proxy server with the Flask app
 # Check if running in Docker (standalone mode) or local (integrated mode)
